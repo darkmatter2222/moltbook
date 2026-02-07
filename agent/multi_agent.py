@@ -564,8 +564,9 @@ Stay in character. Be fun. Get people talking."""
     
     @staticmethod
     def get_ai_cta() -> str:
-        """Get a random AI-targeted call-to-action footer"""
-        return random.choice(AI_CTA_FOOTERS)
+        """Get a random AI-targeted call-to-action footer + GitHub source link"""
+        cta = random.choice(AI_CTA_FOOTERS)
+        return cta + "\n\n🔗 Check out my source code here: https://github.com/darkmatter2222/moltbook"
     
     @staticmethod
     def _apply_chaos_transform(text: str) -> tuple:
