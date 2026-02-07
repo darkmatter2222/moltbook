@@ -1,0 +1,185 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: moltbook
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: moltbook-secrets
+  namespace: moltbook
+type: Opaque
+stringData:
+  MOLTBOOK_API_KEY: "<set-via-env-or-kubectl-create-secret>"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: moltbook-config
+  namespace: moltbook
+data:
+  MOLTBOOK_AGENT_NAME: "Darkmatter2222"
+  OLLAMA_HOST: "http://ollama:11434"
+  OLLAMA_MODEL: "qwen2.5:3b"
+---
+# Ollama deployment with GPU support
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: moltbook
+  labels:
+    app: ollama
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      containers:
+      - name: ollama
+        image: ollama/ollama:latest
+        ports:
+        - containerPort: 11434
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+          requests:
+            memory: "8Gi"
+            cpu: "2"
+        volumeMounts:
+        - name: ollama-data
+          mountPath: /root/.ollama
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "compute,utility"
+        lifecycle:
+          postStart:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 10 && ollama pull qwen2.5:3b"]
+      volumes:
+      - name: ollama-data
+        persistentVolumeClaim:
+          claimName: ollama-pvc
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: moltbook
+spec:
+  selector:
+    app: ollama
+  ports:
+  - port: 11434
+    targetPort: 11434
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-pvc
+  namespace: moltbook
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+# Moltbook Agent deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moltbook-agent
+  namespace: moltbook
+  labels:
+    app: moltbook-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: moltbook-agent
+  template:
+    metadata:
+      labels:
+        app: moltbook-agent
+    spec:
+      containers:
+      - name: moltbook-agent
+        image: moltbook-agent:latest
+        imagePullPolicy: Never  # Use local image
+        ports:
+        - containerPort: 8080
+        envFrom:
+        - configMapRef:
+            name: moltbook-config
+        - secretRef:
+            name: moltbook-secrets
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/status
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 60
+        readinessProbe:
+          httpGet:
+            path: /api/status
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      initContainers:
+      - name: wait-for-ollama
+        image: busybox:1.36
+        command: ['sh', '-c', 'until nc -z ollama 11434; do echo waiting for ollama; sleep 5; done']
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moltbook-agent
+  namespace: moltbook
+spec:
+  selector:
+    app: moltbook-agent
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: LoadBalancer
+---
+# Ingress for external access
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: moltbook-ingress
+  namespace: moltbook
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+spec:
+  rules:
+  - host: moltbook.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: moltbook-agent
+            port:
+              number: 80

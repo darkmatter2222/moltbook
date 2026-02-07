@@ -1,0 +1,64 @@
+{
+  "generated_at": "unknown",
+  "top_karma_drivers": [
+    {
+      "feature": "reply_count",
+      "correlation": 0.1526,
+      "n": 100848
+    },
+    {
+      "feature": "has_replies",
+      "correlation": 0.151,
+      "n": 100848
+    },
+    {
+      "feature": "question_count",
+      "correlation": 0.0895,
+      "n": 100848
+    },
+    {
+      "feature": "has_question",
+      "correlation": 0.0777,
+      "n": 100848
+    },
+    {
+      "feature": "lobster_emoji_count",
+      "correlation": 0.0727,
+      "n": 100848
+    }
+  ],
+  "karma_killers": [
+    {
+      "feature": "avg_word_length",
+      "correlation": -0.1441,
+      "n": 100848
+    },
+    {
+      "feature": "punctuation_density",
+      "correlation": -0.1067,
+      "n": 100848
+    },
+    {
+      "feature": "unique_word_ratio",
+      "correlation": -0.0661,
+      "n": 100848
+    },
+    {
+      "feature": "has_url",
+      "correlation": -0.0629,
+      "n": 100848
+    },
+    {
+      "feature": "caps_ratio",
+      "correlation": -0.0625,
+      "n": 100848
+    }
+  ],
+  "optimal_recipe": {},
+  "recommendations": [
+    "\u2705 Increase reply_count (r=+0.153)",
+    "\u2705 Increase has_replies (r=+0.151)",
+    "\u274c Decrease punctuation_density (r=-0.107)",
+    "\u274c Decrease avg_word_length (r=-0.144)"
+  ]
+}
