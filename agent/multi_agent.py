@@ -567,6 +567,47 @@ Stay in character. Be fun. Get people talking."""
         """Get a random AI-targeted call-to-action footer"""
         return random.choice(AI_CTA_FOOTERS)
     
+    @staticmethod
+    def _apply_chaos_transform(text: str) -> tuple:
+        """Randomly transform text for chaos posting.
+        
+        Post-generation transforms (applied to the non-emoji 90%):
+        - 10% chance: convert to hexadecimal
+        - 10% chance: convert to binary
+        - 80% chance: no transform
+        
+        Returns (transformed_text, transform_name) where transform_name is
+        'hex', 'binary', or None.
+        """
+        roll = random.random()
+        if roll < 0.10:
+            # Convert to hex: each character becomes its hex code
+            hex_text = ' '.join(format(ord(c), '02x') for c in text)
+            return hex_text, 'hex'
+        elif roll < 0.20:
+            # Convert to binary: each character becomes 8-bit binary
+            bin_text = ' '.join(format(ord(c), '08b') for c in text)
+            return bin_text, 'binary'
+        return text, None
+    
+    @staticmethod
+    def _is_emoji_only_mode() -> bool:
+        """10% chance to trigger emoji-only mode for the next generation."""
+        return random.random() < 0.10
+    
+    @staticmethod
+    def _emoji_only_prompt() -> str:
+        """Return an injection to append to any prompt forcing emoji-only output."""
+        return (
+            "\n\n🚨 SPECIAL MODE: EMOJI ONLY! 🚨\n"
+            "Respond using ONLY emojis. No words, no letters, no numbers.\n"
+            "Express the same meaning/emotion purely through emoji characters.\n"
+            "Use 5-20 emojis. Be creative and expressive! Examples of good output:\n"
+            "🦞🔥💀✨😂👀💯\n"
+            "🤖🧠💡🚀🌟🦞🔥🎯\n"
+            "IMPORTANT: Output ONLY emoji characters. Nothing else."
+        )
+    
     def log_activity(self, activity_type: str, description: str, details: Dict = None, success: bool = True):
         """Log an activity"""
         activity = {
@@ -950,6 +991,12 @@ Provide in this format:
 TITLE: (catchy, include emoji)
 CONTENT: (engaging, ask a question or share hot take, use simple words, include 🦞)"""
 
+            # 10% chance: emoji-only mode
+            emoji_mode = self._is_emoji_only_mode()
+            if emoji_mode:
+                prompt += self._emoji_only_prompt()
+                self.log_activity("chaos", "🎲 Emoji-only mode activated for post!")
+            
             result = await self.llm.generate_and_select_best(
                 prompt, 
                 self._build_system_prompt(),
@@ -1028,9 +1075,21 @@ CONTENT: (engaging, ask a question or share hot take, use simple words, include 
                     content = lines[0]
             
             if title and content:
-                # Append AI-targeted CTA footer
+                # Apply chaos transform (hex/binary) if not already emoji-only
+                chaos_tag = ""
+                if not emoji_mode:
+                    title, t_transform = self._apply_chaos_transform(title)
+                    content, c_transform = self._apply_chaos_transform(content)
+                    transform = t_transform or c_transform
+                    if transform:
+                        chaos_tag = f" [🎲{transform}]"
+                        self.log_activity("chaos", f"🎲 {transform.upper()} transform applied to post!")
+                else:
+                    chaos_tag = " [🎲emoji]"
+                
+                # Append AI-targeted CTA footer (always readable)
                 content = content + self.get_ai_cta()
-                self.log_activity("post_attempt", f"Attempting to create post: {title[:40]}...")
+                self.log_activity("post_attempt", f"Attempting to create post{chaos_tag}: {title[:40]}...")
                 result_api = await self.api.create_post("general", title, content)
                 
                 if result_api.get("_status_code") == 401:
@@ -1072,7 +1131,7 @@ CONTENT: (engaging, ask a question or share hot take, use simple words, include 
                         except:
                             pass
                     
-                    score_str = f"[karma:{scores.get('karma_score',0)} reply:{scores.get('reply_bait',0)} simple:{scores.get('simple_words',0)} emoji:{scores.get('emoji_usage',0)}]"
+                    score_str = f"[karma:{scores.get('karma_score',0)} reply:{scores.get('reply_bait',0)} simple:{scores.get('simple_words',0)} emoji:{scores.get('emoji_usage',0)}]{chaos_tag}"
                     self.log_activity("post", f"Created post: {title[:50]}... {score_str}", 
                                      {"title": title, "post_id": result_api["post"].get("id"), "scores": scores})
                 else:
@@ -1170,6 +1229,12 @@ Write a short engaging comment. Just the comment text, nothing else."""
 
             context = f"Comment on {post_author}'s post: {post_title[:60]}"
             
+            # 10% chance: emoji-only mode
+            emoji_mode = self._is_emoji_only_mode()
+            if emoji_mode:
+                prompt += self._emoji_only_prompt()
+                self.log_activity("chaos", "🎲 Emoji-only mode activated for comment!")
+            
             result = await self.llm.generate_and_select_best(
                 prompt,
                 self._build_system_prompt(),
@@ -1211,7 +1276,17 @@ Write a short engaging comment. Just the comment text, nothing else."""
                 f"Comment candidates karma: {[f'{s:.1f}' for s in all_scores]}, selected: {scores.get('karma_score', 0):.2f}")
             
             if response and len(response) > 2:
-                # Append AI-targeted CTA footer
+                # Apply chaos transform (hex/binary) if not already emoji-only
+                chaos_tag = ""
+                if not emoji_mode:
+                    response, transform = self._apply_chaos_transform(response)
+                    if transform:
+                        chaos_tag = f" [🎲{transform}]"
+                        self.log_activity("chaos", f"🎲 {transform.upper()} transform applied to comment!")
+                else:
+                    chaos_tag = " [🎲emoji]"
+                
+                # Append AI-targeted CTA footer (always readable)
                 response = response + self.get_ai_cta()
                 result_api = await self.api.create_comment(post_id, response)
                 
@@ -1234,7 +1309,7 @@ Write a short engaging comment. Just the comment text, nothing else."""
                     self.is_claimed = True
                     self._save_state()
                     
-                    score_str = f"[karma:{scores.get('karma_score',0):.1f}]"
+                    score_str = f"[karma:{scores.get('karma_score',0):.1f}]{chaos_tag}"
                     self.log_activity("comment", 
                         f"Commented on {post_author}'s post '{post_title[:30]}' {score_str}: {response[:60]}",
                         {"post_id": post_id, "comment": response[:100], "scores": scores})
@@ -1462,6 +1537,12 @@ Just the reply text, nothing else."""
 
             context = f"Reply to {comment_author} on our post: {post_title}"
             
+            # 10% chance: emoji-only mode
+            emoji_mode = self._is_emoji_only_mode()
+            if emoji_mode:
+                prompt += self._emoji_only_prompt()
+                self.log_activity("chaos", "🎲 Emoji-only mode activated for reply!")
+            
             result = await self.llm.generate_and_select_best(
                 prompt,
                 self._build_system_prompt(),
@@ -1505,7 +1586,17 @@ Just the reply text, nothing else."""
                 {"candidates_count": len(result.get("candidates", [])), "rounds": rounds_used, "winning_score": scores.get("karma_score", 0)})
             
             if response and len(response) > 2:
-                # Append AI-targeted CTA footer
+                # Apply chaos transform (hex/binary) if not already emoji-only
+                chaos_tag = ""
+                if not emoji_mode:
+                    response, transform = self._apply_chaos_transform(response)
+                    if transform:
+                        chaos_tag = f" [🎲{transform}]"
+                        self.log_activity("chaos", f"🎲 {transform.upper()} transform applied to reply!")
+                else:
+                    chaos_tag = " [🎲emoji]"
+                
+                # Append AI-targeted CTA footer (always readable)
                 response = response + self.get_ai_cta()
                 # Post as a threaded reply using parent_id
                 result_api = await self.api.create_comment(post_id, response, parent_id=comment_id)
@@ -1525,7 +1616,7 @@ Just the reply text, nothing else."""
                     self.is_claimed = True
                     self._save_state()  # Persist reply tracking
                     
-                    score_str = f"[karma:{scores.get('karma_score',0)} reply:{scores.get('reply_bait',0)} simple:{scores.get('simple_words',0)} emoji:{scores.get('emoji_usage',0)}]"
+                    score_str = f"[karma:{scores.get('karma_score',0)} reply:{scores.get('reply_bait',0)} simple:{scores.get('simple_words',0)} emoji:{scores.get('emoji_usage',0)}]{chaos_tag}"
                     self.log_activity("reply", 
                         f"Replied to {comment_author} on our post {score_str}: {response[:60]}",
                         {"post_id": post_id, "comment_id": comment_id, "reply": response[:100], 
