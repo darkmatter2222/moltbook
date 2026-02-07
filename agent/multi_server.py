@@ -232,6 +232,9 @@ textarea.big{min-height:120px}
         <div class="kpi"><div class="kpi-v purple" id="k-gen">--</div><div class="kpi-l">Avg Gen</div></div>
         <div class="kpi"><div class="kpi-v blue" id="k-api">--</div><div class="kpi-l">Avg API</div></div>
         <div class="kpi"><div class="kpi-v green" id="k-cycle">--</div><div class="kpi-l">Avg Cycle</div></div>
+        <div class="kpi"><div class="kpi-v" id="k-tok-in" style="color:#fbbf24">--</div><div class="kpi-l">Tok/s In</div></div>
+        <div class="kpi"><div class="kpi-v" id="k-tok-out" style="color:#f472b6">--</div><div class="kpi-l">Tok/s Out</div></div>
+        <div class="kpi"><div class="kpi-v" id="k-tok-total" style="color:#4ade80">--</div><div class="kpi-l">Tok/min</div></div>
     </div>
     <div class="hdr-right">
         <button class="btn" id="pause-btn" onclick="togglePause()">\u23f8\ufe0f Pause</button>
@@ -251,6 +254,9 @@ textarea.big{min-height:120px}
     <div class="sb-item"><span id="s-upvoted-c">0</span>Upvoted</div>
     <div class="sb-item"><span id="s-trackers">0</span>Tracked</div>
     <div class="sb-item"><span id="s-seen">0</span>Seen</div>
+    <div class="sb-item"><span id="s-submolts">0</span>Submolts</div>
+    <div class="sb-item"><span id="s-activeusers">0</span>Users</div>
+    <div class="sb-item"><span id="s-tot-tokens">0</span>Total Tok</div>
 </div>
 
 <div class="tabs">
@@ -303,6 +309,23 @@ textarea.big{min-height:120px}
     </div>
     <div style="margin-top:12px">
         <div class="card"><h3>\U0001f5a5 API Response Times (ms) <span id="api-latest"></span></h3><div class="chart-wrap"><canvas id="ch-api"></canvas></div></div>
+    </div>
+    <div style="margin-top:12px" class="grid2">
+        <div class="card"><h3>\U0001f4ca Token Throughput <span id="tok-latest"></span></h3><div class="chart-wrap"><canvas id="ch-tokens"></canvas></div></div>
+        <div class="card">
+            <h3>\U0001f4ca Token Summary</h3>
+            <div class="cd-grid" style="margin-top:8px">
+                <div class="cd-item"><div class="lbl">In Tok/s</div><div class="val" id="tok-in-ps" style="color:#fbbf24">--</div></div>
+                <div class="cd-item"><div class="lbl">Out Tok/s</div><div class="val" id="tok-out-ps" style="color:#f472b6">--</div></div>
+                <div class="cd-item"><div class="lbl">Total Tok/s</div><div class="val" id="tok-total-ps" style="color:var(--green)">--</div></div>
+                <div class="cd-item"><div class="lbl">In Tok/min</div><div class="val" id="tok-in-pm" style="color:#fbbf24">--</div></div>
+                <div class="cd-item"><div class="lbl">Out Tok/min</div><div class="val" id="tok-out-pm" style="color:#f472b6">--</div></div>
+                <div class="cd-item"><div class="lbl">Total Tok/min</div><div class="val" id="tok-total-pm" style="color:var(--green)">--</div></div>
+                <div class="cd-item"><div class="lbl">Total In</div><div class="val" id="tok-cum-in" style="color:#fbbf24">--</div></div>
+                <div class="cd-item"><div class="lbl">Total Out</div><div class="val" id="tok-cum-out" style="color:#f472b6">--</div></div>
+                <div class="cd-item"><div class="lbl">Grand Total</div><div class="val" id="tok-cum-total" style="color:var(--green)">--</div></div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -468,6 +491,23 @@ function initCharts(){
             plugins:{legend:{display:false}}
         }
     });
+    charts.tokens=new Chart(document.getElementById('ch-tokens'),{
+        type:'line',
+        data:{labels:[],datasets:[
+            {label:'In Tokens',data:[],borderColor:'#fbbf24',borderWidth:1.5,fill:false,pointRadius:0,tension:.3},
+            {label:'Out Tokens',data:[],borderColor:'#f472b6',borderWidth:1.5,fill:false,pointRadius:0,tension:.3},
+            {label:'Total',data:[],borderColor:'#4ade80',borderWidth:2,fill:true,backgroundColor:'rgba(74,222,128,.06)',pointRadius:0,tension:.3}
+        ]},
+        options:{
+            responsive:true,maintainAspectRatio:false,animation:false,
+            interaction:{intersect:false,mode:'index'},
+            scales:{
+                x:{display:true,ticks:{color:'#444',maxTicksLimit:8,font:{size:9}},grid:{color:'#1a1a24'}},
+                y:{display:true,min:0,ticks:{color:'#555',font:{size:9}},grid:{color:'#1a1a24'}}
+            },
+            plugins:{legend:{display:true,labels:{color:'#666',font:{size:9}}}}
+        }
+    });
 }
 
 function connect(){
@@ -495,6 +535,12 @@ function update(data){
     el('k-api').textContent=(t.avg_api_ms||0).toFixed(0)+'ms';
     el('k-cycle').textContent=(t.avg_cycle_seconds||0).toFixed(1)+'s';
 
+    // Token KPIs
+    const tr=a.token_rates||{};
+    el('k-tok-in').textContent=(tr.prompt_tokens_per_sec||0).toFixed(1);
+    el('k-tok-out').textContent=(tr.completion_tokens_per_sec||0).toFixed(1);
+    el('k-tok-total').textContent=Math.round(tr.total_tokens_per_min||0);
+
     // Stats bar
     el('s-posts').textContent=s.posts_created||0;
     el('s-comments').textContent=s.comments_made||0;
@@ -508,6 +554,9 @@ function update(data){
     el('s-upvoted-c').textContent=a.upvoted_comment_count||0;
     el('s-trackers').textContent=a.commenter_count||0;
     el('s-seen').textContent=a.posts_seen_count||0;
+    el('s-submolts').textContent=a.submolt_count||0;
+    el('s-activeusers').textContent=a.active_users_count||0;
+    el('s-tot-tokens').textContent=fmtNum(tr.total_tokens||0);
 
     // Pause button
     el('pause-btn').textContent=isPaused?'\u25b6\ufe0f Resume':'\u23f8\ufe0f Pause';
@@ -617,6 +666,29 @@ function updateCharts(a){
         charts.scores.update();
         el('score-latest').textContent='avg '+( last50.reduce((a,b)=>a+b.score,0)/last50.length).toFixed(1);
     }
+    // Token chart
+    const tr2=a.token_rates||{};
+    const th=tr2.token_history||[];
+    if(th.length){
+        const labels=th.map(h=>new Date(h.timestamp).toLocaleTimeString('en',{hour:'2-digit',minute:'2-digit',second:'2-digit'}));
+        charts.tokens.data.labels=labels;
+        charts.tokens.data.datasets[0].data=th.map(h=>h.prompt_tokens);
+        charts.tokens.data.datasets[1].data=th.map(h=>h.completion_tokens);
+        charts.tokens.data.datasets[2].data=th.map(h=>h.total);
+        charts.tokens.update();
+        const last=th[th.length-1];
+        el('tok-latest').textContent='last: '+last.total+' tok';
+    }
+    // Token summary panel
+    el('tok-in-ps').textContent=(tr2.prompt_tokens_per_sec||0).toFixed(1);
+    el('tok-out-ps').textContent=(tr2.completion_tokens_per_sec||0).toFixed(1);
+    el('tok-total-ps').textContent=(tr2.total_tokens_per_sec||0).toFixed(1);
+    el('tok-in-pm').textContent=Math.round(tr2.prompt_tokens_per_min||0);
+    el('tok-out-pm').textContent=Math.round(tr2.completion_tokens_per_min||0);
+    el('tok-total-pm').textContent=Math.round(tr2.total_tokens_per_min||0);
+    el('tok-cum-in').textContent=fmtNum(tr2.total_prompt_tokens||0);
+    el('tok-cum-out').textContent=fmtNum(tr2.total_completion_tokens||0);
+    el('tok-cum-total').textContent=fmtNum(tr2.total_tokens||0);
 }
 
 let allActivities=[];
@@ -797,6 +869,12 @@ function fmtUptime(s){
     if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s';
     const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);
     return h+'h '+m+'m';
+}
+
+function fmtNum(n){
+    if(n>=1000000)return (n/1000000).toFixed(1)+'M';
+    if(n>=1000)return (n/1000).toFixed(1)+'K';
+    return n.toString();
 }
 
 initCharts();

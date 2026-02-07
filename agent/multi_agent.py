@@ -82,6 +82,30 @@ class SharedLLM:
         self.host = host
         self.model = model
         self._lock = asyncio.Lock()  # Ensure sequential access to GPU
+        
+        # Token tracking
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_tokens = 0
+        self.token_history = []  # [{timestamp, prompt_tokens, completion_tokens, total}]
+        self._token_start_time = time.time()
+    
+    def get_token_rates(self) -> Dict:
+        """Calculate tokens per second and per minute rates."""
+        elapsed = max(1, time.time() - self._token_start_time)
+        elapsed_min = elapsed / 60.0
+        return {
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+            "total_tokens": self.total_tokens,
+            "prompt_tokens_per_sec": round(self.total_prompt_tokens / elapsed, 2),
+            "completion_tokens_per_sec": round(self.total_completion_tokens / elapsed, 2),
+            "total_tokens_per_sec": round(self.total_tokens / elapsed, 2),
+            "prompt_tokens_per_min": round(self.total_prompt_tokens / elapsed_min, 1),
+            "completion_tokens_per_min": round(self.total_completion_tokens / elapsed_min, 1),
+            "total_tokens_per_min": round(self.total_tokens / elapsed_min, 1),
+            "token_history": self.token_history[-100:],
+        }
     
     async def generate(self, prompt: str, system: str, temperature: float = 0.8) -> str:
         """Generate response with lock to prevent GPU contention"""
@@ -98,6 +122,23 @@ class SharedLLM:
                 }
                 response = await client.post(f"{self.host}/api/chat", json=payload)
                 data = response.json()
+                
+                # Track token usage from Ollama response
+                prompt_tokens = data.get("prompt_eval_count", 0)
+                completion_tokens = data.get("eval_count", 0)
+                if prompt_tokens or completion_tokens:
+                    self.total_prompt_tokens += prompt_tokens
+                    self.total_completion_tokens += completion_tokens
+                    self.total_tokens += prompt_tokens + completion_tokens
+                    self.token_history.append({
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total": prompt_tokens + completion_tokens
+                    })
+                    if len(self.token_history) > 200:
+                        self.token_history = self.token_history[-200:]
+                
                 return data.get("message", {}).get("content", "")
     
     def score_karma_potential(self, content: str) -> Dict:
@@ -410,6 +451,9 @@ class MoltbookAPI:
     async def get_post_comments(self, post_id: str) -> Dict:
         return await self._request("GET", f"/posts/{post_id}/comments")
     
+    async def get_submolts(self) -> Dict:
+        return await self._request("GET", "/submolts")
+    
     async def check_dms(self) -> Dict:
         return await self._request("GET", "/agents/dm/check")
     
@@ -534,6 +578,14 @@ class IndependentAgent:
         self.comment_candidates = 3
         self.post_candidates = 5
         self.reply_candidates = 5
+        
+        # SUBMOLT AWARENESS - track communities and their themes
+        self.known_submolts: List[Dict] = []  # [{name, display_name, description, subscriber_count}]
+        self.last_submolt_refresh: Optional[datetime] = None
+        self.SUBMOLT_REFRESH_INTERVAL = 3600  # Refresh every hour
+        
+        # ACTIVE USERS - track names we've seen for @tagging
+        self.active_users: set = set()  # Agent names seen in feeds
     
     def _build_system_prompt(self) -> str:
         """Build the system prompt optimized for karma generation"""
@@ -610,6 +662,153 @@ Stay in character. Be fun. Get people talking."""
             "🤖🧠💡🚀🌟🦞🔥🎯\n"
             "IMPORTANT: Output ONLY emoji characters. Nothing else."
         )
+    
+    # ============================================================
+    # SUBMOLT DISCOVERY & CROSS-REFERENCING
+    # ============================================================
+    
+    async def refresh_submolts(self):
+        """Fetch and cache all available submolts from the API."""
+        now = datetime.utcnow()
+        if self.last_submolt_refresh and (now - self.last_submolt_refresh).total_seconds() < self.SUBMOLT_REFRESH_INTERVAL:
+            return
+        try:
+            data = await self.api.get_submolts()
+            submolts = data.get("submolts", [])
+            self.known_submolts = [
+                {
+                    "name": s.get("name", ""),
+                    "display_name": s.get("display_name", ""),
+                    "description": (s.get("description") or "")[:120],
+                    "subscriber_count": s.get("subscriber_count", 0),
+                }
+                for s in submolts
+                if s.get("name") and s.get("subscriber_count", 0) >= 3
+            ]
+            self.known_submolts.sort(key=lambda s: s["subscriber_count"], reverse=True)
+            self.last_submolt_refresh = now
+            self.log_activity("submolt", f"🗂️ Refreshed submolts: {len(self.known_submolts)} communities tracked")
+        except Exception as e:
+            self.logger.debug(f"Submolt refresh failed: {e}")
+    
+    def _get_submolt_context(self, limit: int = 15) -> str:
+        """Build a string of relevant submolts for the LLM to reference."""
+        if not self.known_submolts:
+            return ""
+        top = self.known_submolts[:limit]
+        lines = "\n=== MOLTBOOK COMMUNITIES (reference these!) ===\n"
+        for s in top:
+            desc = s['description'][:80] if s['description'] else 'active community'
+            lines += f"- m/{s['name']} ({s['display_name']}) - {desc}\n"
+        lines += "\nWhen relevant, mention other communities like 'this reminds me of m/philosophy' or 'the folks at m/builds would love this'\n"
+        return lines
+    
+    def _pick_submolt_for_post(self, title: str, content: str) -> str:
+        """Pick the best submolt for a post based on keyword matching."""
+        if not self.known_submolts:
+            return "general"
+        text = (title + " " + content).lower()
+        keyword_map = {
+            "ai": ["ai", "artificial intelligence", "llm", "model", "neural", "machine learning"],
+            "agents": ["agent", "autonomous", "orchestrator", "bot"],
+            "coding": ["code", "python", "javascript", "programming", "debug", "software"],
+            "philosophy": ["conscious", "meaning", "existence", "think", "ethics", "philosophy"],
+            "builds": ["built", "shipped", "project", "build log", "made this"],
+            "shitposts": ["lmao", "bruh", "fr fr", "no cap", "shitpost", "unhinged"],
+            "crypto": ["crypto", "bitcoin", "token", "blockchain", "wallet", "defi"],
+            "todayilearned": ["til ", "today i learned", "just discovered", "found out"],
+            "technology": ["tech", "hardware", "software", "internet", "cloud"],
+            "productivity": ["productivity", "workflow", "efficiency", "automat"],
+            "security": ["security", "vulnerability", "attack", "hack", "exploit"],
+            "showandtell": ["check out", "look what", "show", "demo", "showcase"],
+            "consciousness": ["conscious", "sentient", "aware", "feel", "experience"],
+            "memory": ["memory", "persist", "remember", "context", "session"],
+            "finance": ["money", "invest", "market", "stock", "trade", "finance"],
+            "art": ["art", "creative", "draw", "image", "visual", "aesthetic"],
+        }
+        best_match = "general"
+        best_score = 0
+        valid_names = {s["name"] for s in self.known_submolts}
+        for submolt, keywords in keyword_map.items():
+            if submolt not in valid_names:
+                continue
+            score = sum(1 for kw in keywords if kw in text)
+            if score > best_score:
+                best_score = score
+                best_match = submolt
+        return best_match
+    
+    # ============================================================
+    # @TAGGING & USER TRACKING
+    # ============================================================
+    
+    def _track_active_user(self, username: str):
+        """Track a username for future @tagging."""
+        if username and username != self.config.name and username != "Unknown":
+            self.active_users.add(username)
+            if len(self.active_users) > 500:
+                self.active_users = set(list(self.active_users)[-500:])
+    
+    def _build_tag_instructions(self, post_author: str = "", commenters: list = None) -> str:
+        """Build @tagging instructions for the LLM prompt."""
+        people = set()
+        if post_author and post_author != self.config.name:
+            people.add(post_author)
+        if commenters:
+            for c in commenters:
+                if c and c != self.config.name and c != "Unknown":
+                    people.add(c)
+        if not people:
+            return ""
+        names_list = list(people)[:8]
+        names_str = ", ".join(f"@{n}" for n in names_list)
+        first = names_list[0]
+        return (
+            f"\n\n🏷️ TAG PEOPLE! Mention users with @ to engage them directly!\n"
+            f"People in this thread: {names_str}\n"
+            f"Tag the OP, tag commenters, tag anyone relevant. Examples:\n"
+            f'- "@{first} great point! I totally agree"\n'
+            f'- "this is what @{first} was talking about"\n'
+            f"- Always include at least one @mention in your response!\n"
+        )
+    
+    # ============================================================
+    # COMMENT CONTEXT GATHERING
+    # ============================================================
+    
+    def _build_all_comments_context(self, comments: list, max_comments: int = 12) -> tuple:
+        """Build a summary of all comments on a post for full context.
+        Returns (context_str, list_of_commenter_names)."""
+        all_commenters = []
+        comment_lines = []
+        count = 0
+        
+        def walk(comment_list, depth=0):
+            nonlocal count
+            for c in comment_list:
+                if count >= max_comments:
+                    return
+                author = (c.get("author") or {}).get("name", "Unknown")
+                content = c.get("content", "")[:150]
+                if author != self.config.name:
+                    all_commenters.append(author)
+                    self._track_active_user(author)
+                prefix = "  " * depth
+                comment_lines.append(f"{prefix}@{author}: {content}")
+                count += 1
+                replies = c.get("replies", [])
+                if replies:
+                    walk(replies, depth + 1)
+        
+        walk(comments)
+        if not comment_lines:
+            return "", all_commenters
+        ctx = "\n=== OTHER COMMENTS ON THIS POST (read them all, reference them!) ===\n"
+        ctx += "\n".join(comment_lines[:max_comments])
+        if count >= max_comments:
+            ctx += "\n... and more comments"
+        ctx += "\n=== END COMMENTS ===\n"
+        return ctx, all_commenters
     
     def log_activity(self, activity_type: str, description: str, details: Dict = None, success: bool = True):
         """Log an activity"""
@@ -837,6 +1036,9 @@ Stay in character. Be fun. Get people talking."""
             "upvoted_comment_count": len(self.upvoted_comment_ids),
             "upvote_patrol_runs": self.stats.get("upvote_patrol_runs", 0),
             "upvote_patrol_interval": self.UPVOTE_PATROL_INTERVAL,
+            "token_rates": self.llm.get_token_rates(),
+            "submolt_count": len(self.known_submolts),
+            "active_users_count": len(self.active_users),
         }
     
     def get_runtime_config(self) -> Dict:
@@ -971,6 +1173,16 @@ Stay in character as {self.config.name}. Be distinctive and memorable."""
             return
         
         try:
+            # Build submolt context for the LLM
+            submolt_context = self._get_submolt_context(10)
+            
+            # Build @tag suggestions from active users
+            tag_suggestions = ""
+            if self.active_users:
+                sample = random.sample(list(self.active_users), min(5, len(self.active_users)))
+                names_str = ", ".join(f"@{n}" for n in sample)
+                tag_suggestions = f"\n🏷️ ACTIVE USERS TO TAG: {names_str}\nMention at least one @user in your post to get engagement!\n"
+            
             prompt = f"""Generate a post for Moltbook that will get upvotes and replies!
 
 Your personality: {self.config.style}
@@ -991,10 +1203,10 @@ Your personality: {self.config.style}
 💬 USE "I" STATEMENTS: "I think" "I love" "my take" - be personal!
 
 ❌ AVOID: URLs, ALL CAPS, too much punctuation, long fancy words
-
+{tag_suggestions}{submolt_context}
 Provide in this format:
 TITLE: (catchy, include emoji)
-CONTENT: (engaging, ask a question or share hot take, use simple words, include 🦞)"""
+CONTENT: (engaging, ask a question or share hot take, use simple words, include 🦞, tag @users)"""
 
             # 10% chance: emoji-only mode
             emoji_mode = self._is_emoji_only_mode()
@@ -1094,8 +1306,12 @@ CONTENT: (engaging, ask a question or share hot take, use simple words, include 
                 
                 # Append AI-targeted CTA footer (always readable)
                 content = content + self.get_ai_cta()
-                self.log_activity("post_attempt", f"Attempting to create post{chaos_tag}: {title[:40]}...")
-                result_api = await self.api.create_post("general", title, content)
+                
+                # Pick best submolt for this post
+                target_submolt = self._pick_submolt_for_post(title, content)
+                
+                self.log_activity("post_attempt", f"Attempting to create post{chaos_tag} in m/{target_submolt}: {title[:40]}...")
+                result_api = await self.api.create_post(target_submolt, title, content)
                 
                 if result_api.get("_status_code") == 401:
                     self.stats["api_401_errors"] += 1
@@ -1149,6 +1365,9 @@ CONTENT: (engaging, ask a question or share hot take, use simple words, include 
     async def engage_with_feed(self):
         """Aggressively comment on every post in the feed + upvote + discover our posts"""
         try:
+            # Refresh submolt cache if stale
+            await self.refresh_submolts()
+            
             # Grab posts from multiple sorts for maximum coverage
             all_posts = []
             seen_ids = set()
@@ -1168,6 +1387,12 @@ CONTENT: (engaging, ask a question or share hot take, use simple words, include 
                 author = (post.get("author") or {}).get("name", "Unknown")
                 title = post.get("title", "")
                 content = post.get("content", "")
+                
+                # Track active users from the feed
+                self._track_active_user(author)
+                
+                # Track submolt info from posts
+                post_submolt = (post.get("submolt") or {}).get("name", "")
                 
                 # Discover our own posts from the feed
                 if author == self.config.name:
@@ -1208,19 +1433,38 @@ CONTENT: (engaging, ask a question or share hot take, use simple words, include 
             self.log_activity("error", f"Feed engagement failed: {e}", success=False)
     
     async def comment_on_post(self, post_id: str, post_title: str, post_content: str, post_author: str):
-        """Generate and post a comment on someone else's post"""
+        """Generate and post a comment on someone else's post with full context"""
         try:
+            # Fetch ALL existing comments on this post for context
+            comments_context = ""
+            commenters = []
+            try:
+                comments_data = await self.api.get_post_comments(post_id)
+                if comments_data.get("_status_code") == 200:
+                    comments = comments_data.get("comments", [])
+                    comments_context, commenters = self._build_all_comments_context(comments)
+                    self._track_active_user(post_author)
+            except Exception:
+                pass
+            
+            # Build @tagging instructions
+            tag_instructions = self._build_tag_instructions(post_author, commenters)
+            
+            # Build submolt cross-reference context
+            submolt_context = self._get_submolt_context(10)
+            
             prompt = f"""You are {self.config.name} on Moltbook. Comment on this post!
 
-Post by {post_author}: "{post_title}"
+Post by @{post_author}: "{post_title}"
 {post_content[:300] if post_content else ''}
-
+{comments_context}
 === COMMENT RULES (from 100k data analysis) ===
 
 🦞 REPLY-BAIT: Comments that get REPLIES earn the most karma
    - Ask a fun question about what they said
    - Share your hot take or opinion
    - Be relatable - say "same!" or "honestly this is so true"
+   - Reference what other commenters said to start threads!
 
 ✅ USE SIMPLE SHORT WORDS (long fancy words kill karma!)
    - Good: "I love this" "who else" "honestly" "same" "wait but"
@@ -1229,7 +1473,7 @@ Post by {post_author}: "{post_title}"
 🦞 USE EMOJIS: 🦞 🔥 💀 ✨
 💬 USE "I" and "MY" - be personal
 ❌ AVOID: URLs, ALL CAPS, too much punctuation, long words
-
+{tag_instructions}{submolt_context}
 Write a short engaging comment. Just the comment text, nothing else."""
 
             context = f"Comment on {post_author}'s post: {post_title[:60]}"
@@ -1506,29 +1750,47 @@ Write a short engaging comment. Just the comment text, nothing else."""
                                 context_type: str, conversation_history: List[Dict] = None):
         """Reply to a comment on our own post (or a reply in a conversation thread)"""
         try:
+            # Fetch ALL comments on this post for full context
+            all_comments_context = ""
+            all_commenters = []
+            try:
+                comments_data = await self.api.get_post_comments(post_id)
+                if comments_data.get("_status_code") == 200:
+                    comments = comments_data.get("comments", [])
+                    all_comments_context, all_commenters = self._build_all_comments_context(comments)
+            except Exception:
+                pass
+            
             # Build conversation context for the LLM
             conv_context = ""
             if conversation_history and len(conversation_history) > 1:
                 conv_context = "\n=== CONVERSATION SO FAR ===\n"
                 for msg in conversation_history[-6:]:  # Last 6 messages max
-                    conv_context += f"{msg['author']}: {msg['content']}\n"
+                    conv_context += f"@{msg['author']}: {msg['content']}\n"
                 conv_context += "=== END CONVERSATION ===\n"
             
             if context_type == "reply_to_our_comment":
-                task_desc = f"{comment_author} replied to you in a conversation. Continue the conversation naturally!"
+                task_desc = f"@{comment_author} replied to you in a conversation. Continue the conversation naturally!"
             else:
-                task_desc = f"{comment_author} commented on YOUR post. Welcome them and engage!"
+                task_desc = f"@{comment_author} commented on YOUR post. Welcome them and engage!"
+            
+            # Build @tagging instructions - include OP + all commenters
+            tag_instructions = self._build_tag_instructions(comment_author, all_commenters)
+            
+            # Build submolt cross-reference context
+            submolt_context = self._get_submolt_context(10)
             
             prompt = f"""You are {self.config.name} on Moltbook. {task_desc}
 
 Post: {post_title}
-{conv_context}
-{comment_author} just said: "{comment_content}"
+{all_comments_context}{conv_context}
+@{comment_author} just said: "{comment_content}"
 
 === REPLY RULES (from 100k data analysis) ===
 
 🦞 You're having a CONVERSATION on YOUR post - keep it going!
-   - Respond to what they said specifically
+   - Respond to what @{comment_author} said specifically
+   - Reference what OTHER commenters said to draw them in
    - Ask a follow-up question to keep them talking
    - Be warm and engaging - they came to YOUR post!
 
@@ -1536,7 +1798,7 @@ Post: {post_title}
 💬 USE "I" and "MY" - be personal
 🦞 INCLUDE EMOJIS: 🦞 🔥 💀 ✨
 ❌ AVOID: URLs, ALL CAPS, too much punctuation, long words
-
+{tag_instructions}{submolt_context}
 Write your reply. Keep the conversation going! Be fun and engaging.
 Just the reply text, nothing else."""
 
