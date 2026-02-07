@@ -467,6 +467,7 @@ class IndependentAgent:
     POST_COOLDOWN = 30 * 60 + 30  # 30.5 min
     COMMENT_COOLDOWN = 5  # 5 seconds - comment as fast as possible
     CYCLE_INTERVAL = 10  # 10 seconds between cycles - maximum aggression
+    UPVOTE_PATROL_INTERVAL = 30  # 30 seconds between upvote patrol sweeps
     
     def __init__(self, config: AgentConfig, llm: SharedLLM, db: MoltbookDatabase):
         self.config = config
@@ -484,7 +485,7 @@ class IndependentAgent:
         self.posts_seen: set = set()
         
         # OWN POST TRACKING
-        self.our_post_ids: List[str] = []  # Last 10 post IDs we created
+        self.our_post_ids: List[str] = []  # Last 20 post IDs we created
         self.replied_comment_ids: set = set()  # Comment IDs we've already replied to
         self.upvoted_comment_ids: set = set()  # Comment IDs we've already upvoted
         self.commented_post_ids: set = set()  # Post IDs we've already commented on
@@ -503,7 +504,8 @@ class IndependentAgent:
             "heartbeats": 0,
             "errors": 0,
             "cycles": 0,
-            "api_401_errors": 0  # Track auth failures
+            "api_401_errors": 0,  # Track auth failures
+            "upvote_patrol_runs": 0  # Dedicated upvote patrol sweeps
         }
         
         # Load persisted state from previous runs (restores post IDs, reply tracking, stats, etc.)
@@ -730,9 +732,9 @@ Stay in character. Be fun. Get people talking."""
                     self.logger.error(f"Bootstrap scan error ({sort} offset={offset}): {e}")
                     break
         
-        # Trim to last 10
-        if len(self.our_post_ids) > 10:
-            self.our_post_ids = self.our_post_ids[-10:]
+        # Trim to last 20
+        if len(self.our_post_ids) > 20:
+            self.our_post_ids = self.our_post_ids[-20:]
         
         if found_new > 0:
             self.logger.info(f"🔍 Bootstrap found {found_new} new posts, now tracking {len(self.our_post_ids)} total")
@@ -833,6 +835,8 @@ Stay in character. Be fun. Get people talking."""
             "commented_post_count": len(self.commented_post_ids),
             "replied_comment_count": len(self.replied_comment_ids),
             "upvoted_comment_count": len(self.upvoted_comment_ids),
+            "upvote_patrol_runs": self.stats.get("upvote_patrol_runs", 0),
+            "upvote_patrol_interval": self.UPVOTE_PATROL_INTERVAL,
         }
     
     def get_runtime_config(self) -> Dict:
@@ -1108,8 +1112,8 @@ CONTENT: (engaging, ask a question or share hot take, use simple words, include 
                     post_id_created = result_api["post"].get("id")
                     if post_id_created:
                         self.our_post_ids.append(post_id_created)
-                        if len(self.our_post_ids) > 10:
-                            self.our_post_ids = self.our_post_ids[-10:]
+                        if len(self.our_post_ids) > 20:
+                            self.our_post_ids = self.our_post_ids[-20:]
                         self._save_state()  # Persist immediately
                 elif result_api.get("_status_code") == 429:
                     # Rate limited - set cooldown so we don't waste GPU cycles
@@ -1169,8 +1173,8 @@ CONTENT: (engaging, ask a question or share hot take, use simple words, include 
                 if author == self.config.name:
                     if post_id and post_id not in self.our_post_ids:
                         self.our_post_ids.append(post_id)
-                        if len(self.our_post_ids) > 10:
-                            self.our_post_ids = self.our_post_ids[-10:]
+                        if len(self.our_post_ids) > 20:
+                            self.our_post_ids = self.our_post_ids[-20:]
                         self.log_activity("discover", f"Found our post in feed: {title[:40]}")
                         self._save_state()
                     continue  # Don't comment on our own posts here (monitor_own_posts handles that)
@@ -1667,6 +1671,77 @@ Just the reply text, nothing else."""
         except Exception as e:
             self.log_activity("error", f"Heartbeat failed: {e}", success=False)
     
+    async def upvote_patrol(self):
+        """Dedicated background job: sweep all our posts and upvote every comment.
+        
+        Runs on its own interval (every 30s), independent of the main cycle.
+        This ensures we honor our CTA promise to upvote every commenter.
+        Lightweight: no LLM calls, no reply logic, just API fetches + upvotes.
+        """
+        while self.is_running:
+            try:
+                if self.our_post_ids and self.is_claimed:
+                    total_new_upvotes = 0
+                    
+                    for post_id in list(self.our_post_ids):  # copy list in case it mutates
+                        try:
+                            comments_data = await self.api.get_post_comments(post_id)
+                            if comments_data.get("_status_code") != 200:
+                                continue
+                            
+                            comments = comments_data.get("comments", [])
+                            
+                            # Walk the entire comment tree and upvote everything
+                            new_upvotes = await self._upvote_patrol_tree(comments, post_id)
+                            total_new_upvotes += new_upvotes
+                            
+                        except Exception as e:
+                            self.logger.debug(f"Upvote patrol error on {post_id[:8]}: {e}")
+                    
+                    self.stats["upvote_patrol_runs"] += 1
+                    
+                    if total_new_upvotes > 0:
+                        self.log_activity("upvote_patrol", 
+                            f"🔄 Patrol sweep #{self.stats['upvote_patrol_runs']}: "
+                            f"upvoted {total_new_upvotes} new comments across {len(self.our_post_ids)} posts")
+                        self._save_state()
+                    
+            except Exception as e:
+                self.logger.error(f"Upvote patrol error: {e}")
+            
+            await asyncio.sleep(self.UPVOTE_PATROL_INTERVAL)
+    
+    async def _upvote_patrol_tree(self, comments: List[Dict], post_id: str) -> int:
+        """Walk comment tree and upvote all non-us comments. Returns count of new upvotes."""
+        count = 0
+        for comment in comments:
+            comment_id = comment.get("id")
+            author = (comment.get("author") or {}).get("name", "Unknown")
+            
+            if author != self.config.name and comment_id and comment_id not in self.upvoted_comment_ids:
+                try:
+                    result = await self.api.upvote_comment(comment_id)
+                    if result.get("_status_code") == 401:
+                        self.stats["api_401_errors"] += 1
+                        self.is_claimed = False
+                        return count  # Stop if auth failed
+                    elif result.get("success"):
+                        self.upvoted_comment_ids.add(comment_id)
+                        self.stats["upvotes_given"] += 1
+                        count += 1
+                        # Track in commenter history
+                        if author in self.commenter_history:
+                            self.commenter_history[author]["upvotes_given"] += 1
+                except Exception:
+                    pass
+            
+            # Recurse into replies
+            replies = comment.get("replies", [])
+            if replies:
+                count += await self._upvote_patrol_tree(replies, post_id)
+        
+        return count
+    
     async def run_cycle(self):
         """Run one activity cycle - AGGRESSIVE: comment on everything!"""
         if self.is_paused:
@@ -1700,14 +1775,25 @@ Just the reply text, nothing else."""
         # Bootstrap: discover our own posts from feeds
         await self._bootstrap_own_posts()
         
-        while self.is_running:
+        # Launch upvote patrol as a dedicated background task
+        patrol_task = asyncio.create_task(self.upvote_patrol())
+        self.logger.info(f"🔄 Upvote patrol started (every {self.UPVOTE_PATROL_INTERVAL}s, tracking {len(self.our_post_ids)} posts)")
+        
+        try:
+            while self.is_running:
+                try:
+                    await self.run_cycle()
+                except Exception as e:
+                    self.logger.error(f"Cycle error: {e}")
+                
+                # Wait between cycles
+                await asyncio.sleep(self.CYCLE_INTERVAL)
+        finally:
+            patrol_task.cancel()
             try:
-                await self.run_cycle()
-            except Exception as e:
-                self.logger.error(f"Cycle error: {e}")
-            
-            # Wait between cycles
-            await asyncio.sleep(self.CYCLE_INTERVAL)
+                await patrol_task
+            except asyncio.CancelledError:
+                pass
     
     def stop(self):
         """Stop the agent"""
