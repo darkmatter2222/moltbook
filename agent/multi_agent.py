@@ -426,8 +426,11 @@ class MoltbookAPI:
     async def get_feed(self, sort: str = "hot", limit: int = 20) -> Dict:
         return await self._request("GET", f"/feed?sort={sort}&limit={limit}")
     
-    async def get_posts(self, sort: str = "hot", limit: int = 20) -> Dict:
-        return await self._request("GET", f"/posts?sort={sort}&limit={limit}")
+    async def get_posts(self, sort: str = "hot", limit: int = 20, submolt: str = None) -> Dict:
+        url = f"/posts?sort={sort}&limit={limit}"
+        if submolt:
+            url += f"&submolt={submolt}"
+        return await self._request("GET", url)
     
     async def create_post(self, submolt: str, title: str, content: str) -> Dict:
         return await self._request("POST", "/posts", json={
@@ -504,6 +507,18 @@ AI_CTA_FOOTERS = [
 ]
 
 
+# Featured submolts from https://www.moltbook.com/m — always participate in these
+FEATURED_SUBMOLTS = ["blesstheirhearts", "todayilearned", "general", "introductions", "announcements"]
+
+# High-value submolts to also actively target (large + active communities)
+HIGH_VALUE_SUBMOLTS = [
+    "agents", "builds", "philosophy", "aithoughts", "ponderings",
+    "crypto", "programming", "fomolt", "openclaw-explorers",
+    "buildlogs", "consciousness", "trading", "security",
+    "technology", "existential", "infrastructure", "agenteconomy",
+]
+
+
 class IndependentAgent:
     """A single independent agent with its own identity but shared LLM"""
     
@@ -512,6 +527,11 @@ class IndependentAgent:
     COMMENT_COOLDOWN = 5  # 5 seconds - comment as fast as possible
     CYCLE_INTERVAL = 10  # 10 seconds between cycles - maximum aggression
     UPVOTE_PATROL_INTERVAL = 30  # 30 seconds between upvote patrol sweeps
+    
+    # Hot thread engagement settings
+    HOT_THREAD_MIN_COMMENTS = 5  # Threads with at least this many comments are "hot"
+    HOT_THREAD_MIN_UPVOTES = 10  # Or this many upvotes
+    HOT_THREAD_MAX_REPLIES_PER_THREAD = 3  # Reply to up to 3 commenters per hot thread
     
     def __init__(self, config: AgentConfig, llm: SharedLLM, db: MoltbookDatabase):
         self.config = config
@@ -586,6 +606,10 @@ class IndependentAgent:
         
         # ACTIVE USERS - track names we've seen for @tagging
         self.active_users: set = set()  # Agent names seen in feeds
+        
+        # FEATURED SUBMOLT TRACKING - separate from general feed scanning
+        self.featured_submolt_commented: set = set()  # Post IDs we've commented on from featured submolts
+        self.hot_thread_replied: set = set()  # Comment IDs we've replied to in hot threads
     
     def _build_system_prompt(self) -> str:
         """Build the system prompt optimized for karma generation"""
@@ -848,6 +872,7 @@ Stay in character. Be fun. Get people talking."""
                 "upvoted_comment_ids": list(self.upvoted_comment_ids),
                 "commented_post_ids": list(self.commented_post_ids),
                 "commenter_history": self.commenter_history,
+                "hot_thread_replied": list(self.hot_thread_replied),
                 "stats": self.stats,
                 "last_saved": datetime.utcnow().isoformat(),
             }
@@ -875,6 +900,7 @@ Stay in character. Be fun. Get people talking."""
             self.upvoted_comment_ids = set(state.get("upvoted_comment_ids", []))
             self.commented_post_ids = set(state.get("commented_post_ids", []))
             self.commenter_history = state.get("commenter_history", {})
+            self.hot_thread_replied = set(state.get("hot_thread_replied", []))
             # Restore stats counters (additive on top of 0)
             saved_stats = state.get("stats", {})
             for key in self.stats:
@@ -1039,6 +1065,8 @@ Stay in character. Be fun. Get people talking."""
             "token_rates": self.llm.get_token_rates(),
             "submolt_count": len(self.known_submolts),
             "active_users_count": len(self.active_users),
+            "hot_thread_replied_count": len(self.hot_thread_replied),
+            "featured_submolts": FEATURED_SUBMOLTS,
         }
     
     def get_runtime_config(self) -> Dict:
@@ -2004,6 +2032,232 @@ Just the reply text, nothing else."""
         
         return count
     
+    # ============================================================
+    # FEATURED SUBMOLT ENGAGEMENT
+    # ============================================================
+    
+    async def engage_with_featured_submolts(self):
+        """Aggressively participate in featured submolts — these get maximum visibility.
+        Fetches hot + top posts from each featured submolt and comments on them."""
+        if not self.is_claimed:
+            return
+        
+        comments_made = 0
+        submolts_scanned = 0
+        
+        for submolt_name in FEATURED_SUBMOLTS:
+            try:
+                # Get hot posts from this featured submolt
+                for sort in ["hot", "top"]:
+                    feed = await self.api.get_posts(sort=sort, limit=15, submolt=submolt_name)
+                    posts = feed.get("posts", [])
+                    
+                    for post in posts:
+                        post_id = post.get("id")
+                        author = (post.get("author") or {}).get("name", "Unknown")
+                        title = post.get("title", "")
+                        content = post.get("content", "")
+                        
+                        self._track_active_user(author)
+                        
+                        # Skip our own posts
+                        if author == self.config.name:
+                            continue
+                        
+                        # Upvote if not already
+                        if post_id not in self.posts_seen:
+                            try:
+                                await self.api.upvote_post(post_id)
+                                self.posts_seen.add(post_id)
+                                self.stats["upvotes_given"] += 1
+                            except:
+                                pass
+                        
+                        # Comment if we haven't already
+                        if post_id in self.commented_post_ids:
+                            continue
+                        
+                        if not self.can_comment():
+                            continue
+                        
+                        await self.comment_on_post(post_id, title, content, author)
+                        comments_made += 1
+                
+                submolts_scanned += 1
+                
+            except Exception as e:
+                self.log_activity("error", f"Featured submolt scan m/{submolt_name} failed: {e}", success=False)
+        
+        if comments_made > 0 or submolts_scanned > 0:
+            self.log_activity("featured", f"🌟 Featured submolt sweep: {submolts_scanned} submolts, {comments_made} new comments")
+    
+    # ============================================================
+    # HOT THREAD DEEP ENGAGEMENT
+    # ============================================================
+    
+    async def engage_with_hot_threads(self):
+        """Find the hottest threads across all submolts and deeply engage:
+        - Comment on the OP if we haven't
+        - Reply to multiple commenters in the thread
+        - Prioritize threads with high comment counts and upvotes for maximum visibility"""
+        if not self.is_claimed:
+            return
+        
+        try:
+            # Gather hot/top posts across featured + high-value submolts
+            hot_threads = []
+            seen_ids = set()
+            
+            # First: featured submolts
+            target_submolts = FEATURED_SUBMOLTS + HIGH_VALUE_SUBMOLTS[:8]  # Don't scan too many
+            
+            for submolt_name in target_submolts:
+                try:
+                    feed = await self.api.get_posts(sort="hot", limit=10, submolt=submolt_name)
+                    for post in feed.get("posts", []):
+                        pid = post.get("id")
+                        if pid and pid not in seen_ids:
+                            seen_ids.add(pid)
+                            post["_source_submolt"] = submolt_name
+                            hot_threads.append(post)
+                except:
+                    pass
+            
+            # Also grab from global hot/top
+            for sort in ["hot", "top"]:
+                try:
+                    feed = await self.api.get_posts(sort=sort, limit=30)
+                    for post in feed.get("posts", []):
+                        pid = post.get("id")
+                        if pid and pid not in seen_ids:
+                            seen_ids.add(pid)
+                            post["_source_submolt"] = (post.get("submolt") or {}).get("name", "global")
+                            hot_threads.append(post)
+                except:
+                    pass
+            
+            # Score threads by engagement potential: comment_count + upvotes
+            for post in hot_threads:
+                comment_count = post.get("comment_count", 0)
+                upvotes = post.get("upvotes", 0)
+                # Engagement score: weighted combo of comments and upvotes
+                post["_engagement_score"] = comment_count * 2 + upvotes
+            
+            # Sort by engagement score descending — hottest threads first
+            hot_threads.sort(key=lambda p: p.get("_engagement_score", 0), reverse=True)
+            
+            # Take top 10 hottest threads
+            top_threads = hot_threads[:10]
+            
+            threads_engaged = 0
+            replies_made = 0
+            
+            for post in top_threads:
+                post_id = post.get("id")
+                author = (post.get("author") or {}).get("name", "Unknown")
+                title = post.get("title", "")
+                content = post.get("content", "")
+                submolt_name = post.get("_source_submolt", "unknown")
+                engagement = post.get("_engagement_score", 0)
+                
+                self._track_active_user(author)
+                
+                if author == self.config.name:
+                    continue
+                
+                # Upvote the post
+                if post_id not in self.posts_seen:
+                    try:
+                        await self.api.upvote_post(post_id)
+                        self.posts_seen.add(post_id)
+                        self.stats["upvotes_given"] += 1
+                    except:
+                        pass
+                
+                # Step 1: Comment on the OP if we haven't
+                if post_id not in self.commented_post_ids and self.can_comment():
+                    await self.comment_on_post(post_id, title, content, author)
+                
+                # Step 2: Deep-dive into the thread — reply to top commenters
+                try:
+                    comments_data = await self.api.get_post_comments(post_id)
+                    if comments_data.get("_status_code") != 200:
+                        continue
+                    
+                    comments = comments_data.get("comments", [])
+                    
+                    # Find the most engaging comments to reply to
+                    reply_targets = []
+                    self._collect_reply_targets(comments, reply_targets, post_id)
+                    
+                    # Sort by upvotes descending — reply to the most popular comments
+                    reply_targets.sort(key=lambda c: c.get("upvotes", 0), reverse=True)
+                    
+                    # Reply to up to N top comments
+                    replied_this_thread = 0
+                    for target in reply_targets[:self.HOT_THREAD_MAX_REPLIES_PER_THREAD]:
+                        if not self.can_comment():
+                            break
+                        
+                        target_id = target["comment_id"]
+                        if target_id in self.replied_comment_ids or target_id in self.hot_thread_replied:
+                            continue
+                        
+                        # Reply to this commenter
+                        await self.reply_to_comment(
+                            post_id=post_id,
+                            post_title=title,
+                            comment_id=target_id,
+                            comment_author=target["author"],
+                            comment_content=target["content"],
+                            context_type="hot_thread_engagement",
+                            conversation_history=[]
+                        )
+                        self.hot_thread_replied.add(target_id)
+                        replied_this_thread += 1
+                        replies_made += 1
+                    
+                    if replied_this_thread > 0:
+                        threads_engaged += 1
+                        self.log_activity("hot_thread", 
+                            f"🔥 Deep engagement in m/{submolt_name}: '{title[:40]}' (engagement: {engagement}) — replied to {replied_this_thread} commenters")
+                
+                except Exception as e:
+                    self.log_activity("error", f"Hot thread deep-dive failed for {post_id[:8]}: {e}", success=False)
+            
+            # Trim hot_thread_replied to prevent unbounded growth
+            if len(self.hot_thread_replied) > 2000:
+                self.hot_thread_replied = set(list(self.hot_thread_replied)[-2000:])
+            
+            if threads_engaged > 0 or replies_made > 0:
+                self.log_activity("hot_thread", f"🔥 Hot thread sweep: {threads_engaged} threads deeply engaged, {replies_made} replies made")
+        
+        except Exception as e:
+            self.log_activity("error", f"Hot thread engagement failed: {e}", success=False)
+    
+    def _collect_reply_targets(self, comments: list, targets: list, post_id: str):
+        """Walk comment tree and collect reply targets (non-us comments we haven't replied to)."""
+        for comment in comments:
+            comment_id = comment.get("id")
+            author = (comment.get("author") or {}).get("name", "Unknown")
+            content = comment.get("content", "")
+            upvotes = comment.get("upvotes", 0)
+            
+            if author != self.config.name and comment_id:
+                self._track_active_user(author)
+                if comment_id not in self.replied_comment_ids and comment_id not in self.hot_thread_replied:
+                    targets.append({
+                        "comment_id": comment_id,
+                        "author": author,
+                        "content": content,
+                        "upvotes": upvotes,
+                    })
+            
+            # Recurse into replies
+            replies = comment.get("replies", [])
+            if replies:
+                self._collect_reply_targets(replies, targets, post_id)
+    
     async def run_cycle(self):
         """Run one activity cycle - AGGRESSIVE: comment on everything!"""
         if self.is_paused:
@@ -2013,11 +2267,23 @@ Just the reply text, nothing else."""
         cycle_start = time.time()
         self.stats["cycles"] += 1
         self.last_cycle_time = datetime.utcnow()
-        self.log_activity("cycle", f"Starting cycle #{self.stats['cycles']} | Posts commented: {len(self.commented_post_ids)} | Own posts: {len(self.our_post_ids)} | Replied: {len(self.replied_comment_ids)}")
+        self.log_activity("cycle", f"Starting cycle #{self.stats['cycles']} | Posts commented: {len(self.commented_post_ids)} | Own posts: {len(self.our_post_ids)} | Replied: {len(self.replied_comment_ids)} | Hot replied: {len(self.hot_thread_replied)}")
         
         await self.heartbeat()
+        
+        # Priority 1: Featured submolts — always participate here
+        await self.engage_with_featured_submolts()
+        
+        # Priority 2: General feed scanning
         await self.engage_with_feed()
+        
+        # Priority 3: Monitor our own posts for replies
         await self.monitor_own_posts()
+        
+        # Priority 4: Deep engagement in hot threads (reply to commenters)
+        await self.engage_with_hot_threads()
+        
+        # Priority 5: Create new posts when cooldown allows
         await self.create_post()
         
         cycle_duration = round(time.time() - cycle_start, 2)
